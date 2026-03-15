@@ -324,9 +324,49 @@ class GeminiStreamApp extends AppServer {
       }
     });
 
-    // Auto-start: recording begins as soon as the session opens.
-    // The camera button kills the session (hardware behaviour), which becomes
-    // the natural stop trigger — onStop fires, MediaMTX finalizes, Gemini runs.
+    // Button handler registered via session.events (same pattern as the
+    // MentraOS Camera Example App) — this signals to MentraOS that the app
+    // wants to handle the button, suppressing the default close-app behaviour.
+    // Short press while recording → stop + analyse
+    // Short press while idle    → start a new recording
+    session.events.onButtonPress(async (btn) => {
+      console.log(`[${sessionId}] Button: id=${btn.buttonId} type=${btn.pressType}`);
+      if (btn.pressType !== "short") return;
+
+      if (state.isStreaming) {
+        console.log(`[${sessionId}] ■ Stopping recording (button press)`);
+        state.isStreaming = false;
+        session.camera
+          .stopStream()
+          .catch((err) =>
+            console.error(`[${sessionId}] stopStream error:`, err),
+          );
+        if (!state.analysisTriggered) {
+          state.analysisTriggered = true;
+          waitForSentinel(sessionId)
+            .then((recordingPath) => {
+              if (recordingPath) return analyzeVideo(recordingPath, sessionId);
+              console.error(`[${sessionId}] No recording found after stop`);
+            })
+            .catch((err) =>
+              console.error(`[${sessionId}] Gemini analysis error:`, err),
+            );
+        }
+      } else {
+        console.log(`[${sessionId}] ▶ Starting new recording (button press)`);
+        clearSentinel();
+        state.analysisTriggered = false;
+        state.isStreaming = true;
+        session.camera
+          .startStream({ rtmpUrl: RTMP_URL })
+          .catch((err) => {
+            console.error(`[${sessionId}] startStream error:`, err);
+            state.isStreaming = false;
+          });
+      }
+    });
+
+    // Auto-start: recording begins immediately when the session opens.
     clearSentinel();
     state.isStreaming = true;
     session.camera
