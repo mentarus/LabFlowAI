@@ -248,6 +248,19 @@ class GeminiStreamApp extends AppServer {
     };
     sessionStates.set(sessionId, state);
 
+    // If there's already a managed stream active (e.g. after a reconnect),
+    // log its HLS URL and skip re-requesting — onManagedStreamStatus will
+    // fire with the current state once the listener is registered.
+    const existing = await session.camera.checkExistingStream();
+    if (existing.hasActiveStream) {
+      console.log(
+        `[${sessionId}] Existing stream found (type=${existing.streamInfo?.type}, status=${existing.streamInfo?.status})`,
+      );
+      if (existing.streamInfo?.hlsUrl) {
+        console.log(`[${sessionId}] Reusing HLS: ${existing.streamInfo.hlsUrl}`);
+      }
+    }
+
     session.camera.onManagedStreamStatus(async (status) => {
       console.log(`[${sessionId}] Stream status: ${status.status}`);
 
@@ -278,10 +291,24 @@ class GeminiStreamApp extends AppServer {
       if (status.status === "error") {
         console.error(`[${sessionId}] Stream error — stopping recording`);
         await stopRecording(state, sessionId);
+        if (!state.analysisTriggered && fs.existsSync(state.recordingPath)) {
+          state.analysisTriggered = true;
+          analyzeVideo(state.recordingPath, sessionId).catch((err) =>
+            console.error(`[${sessionId}] Gemini analysis error:`, err),
+          );
+        }
       }
     });
 
-    await session.camera.startManagedStream({ quality: STREAM_QUALITY });
+    // Fire-and-forget: do NOT await. startManagedStream has an internal
+    // timeout (~5 s) waiting for the stream to reach "active". If it times out
+    // it throws, which would crash onSession and tear down the whole session.
+    // We handle all state transitions via onManagedStreamStatus instead.
+    session.camera
+      .startManagedStream({ quality: STREAM_QUALITY })
+      .catch((err) =>
+        console.error(`[${sessionId}] startManagedStream error:`, err),
+      );
     console.log(`[${sessionId}] Managed stream requested (quality=${STREAM_QUALITY})`);
   }
 
@@ -294,9 +321,20 @@ class GeminiStreamApp extends AppServer {
       `[${sessionId}] Session ended (user=${userId}, reason=${reason})`,
     );
     const state = sessionStates.get(sessionId);
+    sessionStates.delete(sessionId); // free the slot immediately so new sessions can connect
     if (state) {
-      await stopRecording(state, sessionId);
-      sessionStates.delete(sessionId);
+      // Fire-and-forget: do NOT await — onStop must return fast or the SDK
+      // blocks new session connections (5 s timeout) while ffmpeg is finalizing.
+      stopRecording(state, sessionId)
+        .then(() => {
+          if (!state.analysisTriggered) {
+            state.analysisTriggered = true;
+            analyzeVideo(state.recordingPath, sessionId).catch((err) =>
+              console.error(`[${sessionId}] Gemini analysis error:`, err),
+            );
+          }
+        })
+        .catch((err) => console.error(`[${sessionId}] Stop error:`, err));
     }
   }
 }
