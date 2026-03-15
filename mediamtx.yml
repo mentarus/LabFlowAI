@@ -1,0 +1,23 @@
+logLevel: info
+logDestinations: [stdout]
+
+# Disable unused protocols — RTMP only
+rtsp: no
+hls: no
+webrtc: no
+srt: no
+
+rtmp: yes
+rtmpAddress: :1935
+
+paths:
+  "live/mentra":
+    record: yes
+    recordFormat: fmp4
+    # One segment per stream (segment ends when glasses disconnect)
+    recordSegmentDuration: 24h
+    # %path expands to "live/mentra" — mediamtx creates /tmp/live/mentra/ automatically
+    recordPath: /tmp/%path/%Y%m%d%H%M%S
+    recordDeleteAfter: 0s
+    # Write the completed recording path to a sentinel file so our app knows it's ready
+    runOnRecordSegmentComplete: sh -c 'echo "$MTX_SEGMENT_PATH" > /tmp/mentra_recording_ready'

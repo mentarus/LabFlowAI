@@ -1,21 +1,20 @@
 /**
  * Mentra Gemini Bridge
  * ====================
- * Uses the MentraOS SDK to start a managed stream from the glasses,
- * records the HLS output to disk with ffmpeg, then analyzes the
- * recording with Gemini when the session ends.
+ * Uses the MentraOS SDK to start an unmanaged RTMP stream from the glasses
+ * directly to MediaMTX (running on this server), records it, then analyzes
+ * the recording with Gemini when the session ends.
  *
  * Flow:
- *   Glasses → MentraOS Cloud (managed stream) → HLS URL
- *                                                  ↓
- *                                    ffmpeg records → /tmp/session_<id>.mp4
- *                                                  ↓
- *                                    Gemini API → /tmp/analysis_<id>.txt
+ *   Glasses → RTMP (port 1935) → MediaMTX → /tmp/mentra_<timestamp>.mp4
+ *                                                       ↓
+ *                                         Gemini API → /tmp/analysis_<id>.txt
  *
  * Requirements:
  *   - bun runtime
- *   - ffmpeg on PATH
- *   - PACKAGE_NAME, MENTRAOS_API_KEY, GEMINI_API_KEY in .env
+ *   - mediamtx binary (path set via MEDIAMTX_BIN)
+ *   - Port 1935 open (TCP inbound) in Oracle Cloud VCN + OS firewall
+ *   - PACKAGE_NAME, MENTRAOS_API_KEY, GEMINI_API_KEY, PUBLIC_IP in .env
  */
 
 import { AppServer, AppSession } from "@mentra/sdk";
@@ -70,9 +69,22 @@ Step-by-Step Procedure (Volumes given for a standard T75 flask) Use Each Step as
    * Check the cells the next day to ensure they have attached and are growing evenly.
 \`\`\``;
 const RECORDING_DIR = process.env.RECORDING_DIR ?? "/tmp";
-const STREAM_QUALITY = (process.env.STREAM_QUALITY ?? "720p") as
-  | "720p"
-  | "1080p";
+
+// MediaMTX
+const MEDIAMTX_BIN =
+  process.env.MEDIAMTX_BIN ??
+  "/home/ubuntu/dev/biodexic-glasses-operator/server/mediamtx";
+const MEDIAMTX_CONFIG =
+  process.env.MEDIAMTX_CONFIG ??
+  path.join(import.meta.dir, "..", "mediamtx.yml");
+
+// Unmanaged RTMP: glasses push directly to MediaMTX on this server
+const PUBLIC_IP = process.env.PUBLIC_IP ?? "";
+const RTMP_PORT = parseInt(process.env.RTMP_PORT ?? "1935");
+const RTMP_STREAM_PATH = "live/mentra";
+
+// MediaMTX writes this file when a recording segment completes
+const RECORDING_SENTINEL = "/tmp/mentra_recording_ready";
 
 if (!PACKAGE_NAME || !API_KEY) {
   console.error("PACKAGE_NAME and MENTRAOS_API_KEY must be set.");
@@ -82,71 +94,87 @@ if (!GEMINI_API_KEY) {
   console.error("GEMINI_API_KEY must be set.");
   process.exit(1);
 }
+if (!PUBLIC_IP) {
+  console.error("PUBLIC_IP must be set (e.g. 163.192.31.247).");
+  process.exit(1);
+}
+
+const RTMP_URL = `rtmp://${PUBLIC_IP}:${RTMP_PORT}/${RTMP_STREAM_PATH}`;
 
 const ai = new GoogleGenAI({ apiKey: GEMINI_API_KEY });
+
+// ---------------------------------------------------------------------------
+// MediaMTX process (can also be run manually in a separate screen window)
+// ---------------------------------------------------------------------------
+let mediamtxProcess: ChildProcess | null = null;
+
+function startMediaMTX(): void {
+  // Skip if already running (e.g. started manually in a screen window)
+  const check = Bun.spawnSync(["ss", "-tlnp"]);
+  const ssOutput = new TextDecoder().decode(check.stdout);
+  if (ssOutput.includes(`:${RTMP_PORT}`)) {
+    console.log(`MediaMTX already listening on port ${RTMP_PORT} — skipping auto-start`);
+    return;
+  }
+  if (!fs.existsSync(MEDIAMTX_BIN)) {
+    console.warn(`MediaMTX binary not found at ${MEDIAMTX_BIN} — start it manually`);
+    return;
+  }
+  console.log(`Starting MediaMTX (${MEDIAMTX_BIN})…`);
+  mediamtxProcess = spawn(MEDIAMTX_BIN, [MEDIAMTX_CONFIG], {
+    stdio: ["ignore", "pipe", "pipe"],
+  });
+  mediamtxProcess.stdout?.on("data", (d: Buffer) =>
+    process.stdout.write(`[mediamtx] ${d}`),
+  );
+  mediamtxProcess.stderr?.on("data", (d: Buffer) =>
+    process.stderr.write(`[mediamtx] ${d}`),
+  );
+  mediamtxProcess.on("close", (code) => {
+    console.log(`MediaMTX exited (code=${code})`);
+    mediamtxProcess = null;
+  });
+}
+
+// ---------------------------------------------------------------------------
+// Recording sentinel helpers
+// ---------------------------------------------------------------------------
+
+/** Delete the sentinel so we don't pick up a stale recording from a previous session. */
+function clearSentinel(): void {
+  try {
+    fs.unlinkSync(RECORDING_SENTINEL);
+  } catch {}
+}
+
+/**
+ * Wait for MediaMTX to write the sentinel file (fired by runOnRecordSegmentComplete).
+ * Returns the recording file path, or null on timeout.
+ */
+async function waitForSentinel(
+  sessionId: string,
+  timeoutMs = 20_000,
+): Promise<string | null> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (fs.existsSync(RECORDING_SENTINEL)) {
+      return fs.readFileSync(RECORDING_SENTINEL, "utf8").trim();
+    }
+    await new Promise((r) => setTimeout(r, 500));
+  }
+  console.warn(`[${sessionId}] Timed out waiting for recording sentinel`);
+  return null;
+}
 
 // ---------------------------------------------------------------------------
 // Per-session state
 // ---------------------------------------------------------------------------
 interface SessionState {
-  ffmpegProcess: ChildProcess | null;
-  recordingPath: string;
   analysisTriggered: boolean;
+  isStreaming: boolean;
 }
 
 const sessionStates = new Map<string, SessionState>();
-
-// ---------------------------------------------------------------------------
-// Recording helpers
-// ---------------------------------------------------------------------------
-function startRecording(
-  hlsUrl: string,
-  recordingPath: string,
-  sessionId: string,
-): ChildProcess {
-  const ffmpeg = spawn(
-    "ffmpeg",
-    [
-      "-y",
-      "-i",
-      hlsUrl,
-      "-c",
-      "copy",
-      // Fragmented MP4: keeps file valid even if ffmpeg is interrupted
-      "-movflags",
-      "frag_keyframe+empty_moov",
-      recordingPath,
-    ],
-    { stdio: ["ignore", "pipe", "pipe"] },
-  );
-  // ffmpeg writes progress to stderr
-  ffmpeg.stderr?.on("data", (d: Buffer) => process.stdout.write(d));
-  ffmpeg.on("close", (code) =>
-    console.log(`[${sessionId}] ffmpeg exited (code=${code})`),
-  );
-  return ffmpeg;
-}
-
-function stopRecording(
-  state: SessionState,
-  sessionId: string,
-): Promise<void> {
-  return new Promise((resolve) => {
-    if (!state.ffmpegProcess) return resolve();
-    const proc = state.ffmpegProcess;
-    state.ffmpegProcess = null;
-    // SIGINT lets ffmpeg flush and finalize the MP4 moov atom
-    proc.kill("SIGINT");
-    const timeout = setTimeout(() => {
-      proc.kill("SIGKILL");
-      resolve();
-    }, 8000);
-    proc.once("close", () => {
-      clearTimeout(timeout);
-      resolve();
-    });
-  });
-}
 
 // ---------------------------------------------------------------------------
 // Gemini analysis
@@ -168,7 +196,7 @@ async function analyzeVideo(
   }
 
   console.log(
-    `[${sessionId}] Uploading ${Math.round(fileSize / 1024)} KB to Gemini...`,
+    `[${sessionId}] Uploading ${Math.round(fileSize / 1024)} KB to Gemini…`,
   );
   let videoFile = await ai.files.upload({
     file: recordingPath,
@@ -178,7 +206,7 @@ async function analyzeVideo(
     },
   });
 
-  console.log(`[${sessionId}] Waiting for Gemini to process video...`);
+  console.log(`[${sessionId}] Waiting for Gemini to process video…`);
   while (videoFile.state?.toString() === "PROCESSING") {
     await new Promise((r) => setTimeout(r, 3000));
     videoFile = await ai.files.get({ name: videoFile.name! });
@@ -194,14 +222,11 @@ async function analyzeVideo(
     return;
   }
 
-  console.log(`[${sessionId}] Running analysis with ${GEMINI_MODEL}...`);
+  console.log(`[${sessionId}] Running analysis with ${GEMINI_MODEL}…`);
   const response = await ai.models.generateContent({
     model: GEMINI_MODEL,
     contents: createUserContent([
-      createPartFromUri(
-        videoFile.uri!,
-        videoFile.mimeType || "video/mp4",
-      ),
+      createPartFromUri(videoFile.uri!, videoFile.mimeType || "video/mp4"),
       GEMINI_PROMPT,
     ]),
     config: {
@@ -216,7 +241,7 @@ async function analyzeVideo(
 
   console.log(`[${sessionId}] Analysis saved → ${outputPath}`);
   console.log(
-    `[${sessionId}] Preview:\n${result.slice(0, 400)}${result.length > 400 ? "..." : ""}`,
+    `[${sessionId}] Preview:\n${result.slice(0, 400)}${result.length > 400 ? "…" : ""}`,
   );
 
   try {
@@ -237,79 +262,80 @@ class GeminiStreamApp extends AppServer {
   ): Promise<void> {
     console.log(`[${sessionId}] Session started (user=${userId})`);
 
-    const recordingPath = path.join(
-      RECORDING_DIR,
-      `session_${sessionId}.mp4`,
-    );
     const state: SessionState = {
-      ffmpegProcess: null,
-      recordingPath,
       analysisTriggered: false,
+      isStreaming: false,
     };
     sessionStates.set(sessionId, state);
 
-    // If there's already a managed stream active (e.g. after a reconnect),
-    // log its HLS URL and skip re-requesting — onManagedStreamStatus will
-    // fire with the current state once the listener is registered.
-    const existing = await session.camera.checkExistingStream();
-    if (existing.hasActiveStream) {
-      console.log(
-        `[${sessionId}] Existing stream found (type=${existing.streamInfo?.type}, status=${existing.streamInfo?.status})`,
-      );
-      if (existing.streamInfo?.hlsUrl) {
-        console.log(`[${sessionId}] Reusing HLS: ${existing.streamInfo.hlsUrl}`);
+    // Clear any stale stream from a previous session
+    try {
+      const existing = await session.camera.checkExistingStream();
+      if (existing.hasActiveStream) {
+        console.log(
+          `[${sessionId}] Stale ${existing.streamInfo?.type} stream found — clearing it`,
+        );
+        if (existing.streamInfo?.type === "managed") {
+          await session.camera.stopManagedStream();
+        } else {
+          await session.camera.stopStream();
+        }
+        await new Promise((r) => setTimeout(r, 1000));
       }
+    } catch (err) {
+      console.warn(`[${sessionId}] Stream pre-check failed (non-fatal):`, err);
     }
 
-    session.camera.onManagedStreamStatus(async (status) => {
+    // RTMP stream status from glasses
+    session.camera.onStreamStatus(async (status) => {
       console.log(`[${sessionId}] Stream status: ${status.status}`);
 
-      if (status.status === "active" && status.hlsUrl) {
-        // Handle mid-session reconnects: stop previous ffmpeg before starting new one
-        if (state.ffmpegProcess) {
-          console.log(`[${sessionId}] Stream reconnected — restarting recording`);
-          await stopRecording(state, sessionId);
-        }
-        console.log(`[${sessionId}] Recording HLS → ${recordingPath}`);
-        state.ffmpegProcess = startRecording(
-          status.hlsUrl,
-          recordingPath,
-          sessionId,
-        );
+      if (status.status === "streaming" || status.status === "active") {
+        state.isStreaming = true;
       }
 
-      if (status.status === "stopped") {
-        await stopRecording(state, sessionId);
+      const terminalStatuses = [
+        "stopped",
+        "disconnected",
+        "timeout",
+        "reconnect_failed",
+      ];
+      if (terminalStatuses.includes(status.status)) {
+        state.isStreaming = false;
         if (!state.analysisTriggered) {
           state.analysisTriggered = true;
-          analyzeVideo(recordingPath, sessionId).catch((err) =>
-            console.error(`[${sessionId}] Gemini analysis error:`, err),
-          );
+          waitForSentinel(sessionId)
+            .then((recordingPath) => {
+              if (recordingPath)
+                return analyzeVideo(recordingPath, sessionId);
+              console.error(`[${sessionId}] No recording found after stop`);
+            })
+            .catch((err) =>
+              console.error(`[${sessionId}] Gemini analysis error:`, err),
+            );
         }
       }
 
       if (status.status === "error") {
-        console.error(`[${sessionId}] Stream error — stopping recording`);
-        await stopRecording(state, sessionId);
-        if (!state.analysisTriggered && fs.existsSync(state.recordingPath)) {
-          state.analysisTriggered = true;
-          analyzeVideo(state.recordingPath, sessionId).catch((err) =>
-            console.error(`[${sessionId}] Gemini analysis error:`, err),
-          );
-        }
+        state.isStreaming = false;
+        console.error(
+          `[${sessionId}] Stream error: ${status.errorDetails ?? "unknown"}`,
+        );
       }
     });
 
-    // Fire-and-forget: do NOT await. startManagedStream has an internal
-    // timeout (~5 s) waiting for the stream to reach "active". If it times out
-    // it throws, which would crash onSession and tear down the whole session.
-    // We handle all state transitions via onManagedStreamStatus instead.
+    // Auto-start: recording begins as soon as the session opens.
+    // The camera button kills the session (hardware behaviour), which becomes
+    // the natural stop trigger — onStop fires, MediaMTX finalizes, Gemini runs.
+    clearSentinel();
+    state.isStreaming = true;
     session.camera
-      .startManagedStream({ quality: STREAM_QUALITY })
-      .catch((err) =>
-        console.error(`[${sessionId}] startManagedStream error:`, err),
-      );
-    console.log(`[${sessionId}] Managed stream requested (quality=${STREAM_QUALITY})`);
+      .startStream({ rtmpUrl: RTMP_URL })
+      .catch((err) => {
+        console.error(`[${sessionId}] startStream error:`, err);
+        state.isStreaming = false;
+      });
+    console.log(`[${sessionId}] Stream requested → ${RTMP_URL}`);
   }
 
   protected async onStop(
@@ -321,18 +347,15 @@ class GeminiStreamApp extends AppServer {
       `[${sessionId}] Session ended (user=${userId}, reason=${reason})`,
     );
     const state = sessionStates.get(sessionId);
-    sessionStates.delete(sessionId); // free the slot immediately so new sessions can connect
-    if (state) {
-      // Fire-and-forget: do NOT await — onStop must return fast or the SDK
-      // blocks new session connections (5 s timeout) while ffmpeg is finalizing.
-      stopRecording(state, sessionId)
-        .then(() => {
-          if (!state.analysisTriggered) {
-            state.analysisTriggered = true;
-            analyzeVideo(state.recordingPath, sessionId).catch((err) =>
-              console.error(`[${sessionId}] Gemini analysis error:`, err),
-            );
-          }
+    sessionStates.delete(sessionId);
+
+    if (state && state.isStreaming && !state.analysisTriggered) {
+      state.analysisTriggered = true;
+      // Glasses are disconnecting — MediaMTX will finalize the recording shortly
+      waitForSentinel(sessionId, 20_000)
+        .then((recordingPath) => {
+          if (recordingPath) return analyzeVideo(recordingPath, sessionId);
+          console.error(`[${sessionId}] No recording found after session end`);
         })
         .catch((err) => console.error(`[${sessionId}] Stop error:`, err));
     }
@@ -342,6 +365,8 @@ class GeminiStreamApp extends AppServer {
 // ---------------------------------------------------------------------------
 // Start server
 // ---------------------------------------------------------------------------
+startMediaMTX();
+
 const app = new GeminiStreamApp({
   packageName: PACKAGE_NAME,
   apiKey: API_KEY,
@@ -360,14 +385,15 @@ console.log("=".repeat(50));
 console.log("Mentra Gemini Bridge");
 console.log(`  Port:      ${PORT}`);
 console.log(`  Package:   ${PACKAGE_NAME}`);
+console.log(`  RTMP:      ${RTMP_URL}`);
 console.log(`  Model:     ${GEMINI_MODEL}`);
-console.log(`  Quality:   ${STREAM_QUALITY}`);
 console.log(`  Output:    ${RECORDING_DIR}/`);
 console.log("=".repeat(50));
-console.log("Waiting for glasses session...\n");
+console.log("Waiting for glasses session…\n");
 
 const shutdown = async () => {
-  console.log("\nShutting down...");
+  console.log("\nShutting down…");
+  mediamtxProcess?.kill("SIGTERM");
   await app.stop();
   process.exit(0);
 };

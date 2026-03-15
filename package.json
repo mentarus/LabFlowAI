@@ -1,0 +1,17 @@
+{
+  "name": "mentra-gemini-bridge",
+  "version": "1.0.0",
+  "type": "module",
+  "scripts": {
+    "dev": "NODE_ENV=development bun --watch src/index.ts",
+    "start": "bun src/index.ts"
+  },
+  "dependencies": {
+    "@mentra/sdk": "3.0.0-hono.6",
+    "@google/genai": "^1.0.0"
+  },
+  "devDependencies": {
+    "@types/bun": "latest",
+    "typescript": "^5.0.0"
+  }
+}
